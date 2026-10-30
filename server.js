@@ -92,7 +92,7 @@ async function requireUser(req, res, next) {
   const match = header.match(/^Bearer\s+(.+)$/i);
   if (!match) return res.status(401).json({ error: 'AutenticaÃ§Ã£o HYPE obrigatÃ³ria.' });
   try {
-    req.hypeUser = await admin.auth().verifyIdToken(match[1]);
+    req.hypeUser = await admin.auth().verifyIdToken(match[1], true);
     return next();
   } catch (_err) {
     return res.status(401).json({ error: 'SessÃ£o invÃ¡lida ou expirada. Entre novamente.' });
@@ -104,6 +104,70 @@ function subscriptionIsActive(state, expiryTime) {
   const stateAllows = ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED'].includes(state);
   return stateAllows && Number.isFinite(expiry) && expiry > Date.now();
 }
+
+// HYPE customer access: server is authoritative for trial/license validity.
+// Music playback implementation is intentionally untouched.
+app.get('/v1/access/me', requireUser, async (req, res) => {
+  const uid = req.hypeUser.uid;
+  try {
+    const [authUser, clientSnap, entitlementSnap] = await Promise.all([
+      admin.auth().getUser(uid),
+      db.collection('hypeClients').doc(uid).get(),
+      db.collection('hypeSubscriptions').doc(uid).get()
+    ]);
+
+    if (authUser.disabled) {
+      return res.status(403).json({ status: 'suspended', active: false, error: 'Conta suspensa.' });
+    }
+    if (clientSnap.exists) {
+      const client = clientSnap.data() || {};
+      if (client.status === 'suspended' || client.status === 'deleted' || client.deleted === true) {
+        return res.status(403).json({ status: 'suspended', active: false, error: 'Conta suspensa ou desativada.' });
+      }
+    }
+
+    if (!entitlementSnap.exists) {
+      return res.status(403).json({ status: 'none', active: false, error: 'Nenhuma licença ou teste ativo.' });
+    }
+    const entitlement = entitlementSnap.data() || {};
+    const expiryMs = entitlement.expiryTime ? Date.parse(entitlement.expiryTime) : 0;
+    if (entitlement.active !== true || !Number.isFinite(expiryMs) || expiryMs <= Date.now()) {
+      return res.status(403).json({ status: 'expired', active: false, expiryTime: entitlement.expiryTime || null, error: 'Licença ou teste expirado.' });
+    }
+
+    if (entitlement.provider === 'trial') {
+      const trialSnap = await db.collection('hypeTrials').doc(uid).get();
+      const trial = trialSnap.exists ? trialSnap.data() : null;
+      const trialExpiry = trial?.expiresAt?.toDate?.()?.getTime?.() || 0;
+      if (!trial || !trialExpiry || trialExpiry <= Date.now()) {
+        return res.status(403).json({ status: 'expired', active: false, error: 'Teste gratuito expirado ou inválido.' });
+      }
+    } else if (entitlement.provider === 'license') {
+      const licenseId = String(entitlement.licenseId || '');
+      if (!licenseId) return res.status(403).json({ status: 'invalid', active: false, error: 'Licença não identificada.' });
+      const licenseSnap = await db.collection('hypeLicenses').doc(licenseId).get();
+      const license = licenseSnap.exists ? licenseSnap.data() : null;
+      const licenseExpiry = license?.expiresAt?.toDate?.()?.getTime?.() || 0;
+      if (!license || license.targetUid !== uid || license.status !== 'active' || !licenseExpiry || licenseExpiry <= Date.now()) {
+        return res.status(403).json({ status: 'invalid', active: false, error: 'Licença inválida, revogada ou vencida.' });
+      }
+    } else {
+      // Do not treat legacy Premium subscriptions as an app-access requirement.
+      return res.status(403).json({ status: 'unsupported', active: false, error: 'Acesso não concedido por licença HYPE ou teste.' });
+    }
+
+    return res.json({
+      status: 'active', active: true,
+      provider: entitlement.provider,
+      plan: entitlement.plan || null,
+      expiryTime: entitlement.expiryTime,
+      uid
+    });
+  } catch (err) {
+    console.error('[access me]', err);
+    return res.status(500).json({ status: 'error', active: false, error: 'Não foi possível validar o acesso.' });
+  }
+});
 
 app.get('/v1/subscriptions/me', requireUser, async (req, res) => {
   try {
