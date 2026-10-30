@@ -1179,8 +1179,11 @@ app.post('/v1/credits/checkout', requireUser, requireOwnerOrReseller, async (req
 });
 app.get('/v1/admin/ledger', requireUser, requireOwnerOrReseller, async (req, res) => {
   try {
-    let q = db.collection('hypeCreditLedger').orderBy('createdAt', 'desc').limit(100);
-    if (req.hypeRole.role !== 'owner') q = q.where('uid', '==', req.hypeUser.uid).orderBy('createdAt', 'desc').limit(100);
+    let q = db.collection('hypeCreditLedger');
+    if (req.hypeRole.role !== 'owner') {
+      q = q.where('uid', '==', req.hypeUser.uid);
+    }
+    q = q.orderBy('createdAt', 'desc').limit(100);
     const snap = await q.get();
     return res.json({ entries: snap.docs.map(d => ({ id: d.id, ...d.data(), createdAt: d.data().createdAt?.toDate?.().toISOString() || null })) });
   } catch (err) {
