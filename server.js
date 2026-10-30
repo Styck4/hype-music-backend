@@ -471,44 +471,97 @@ app.delete('/v1/admin/clients/:uid', requireUser, requireOwnerOrReseller, async 
 
 // Owner-controlled price book. Prices are in BRL cents; never accepted from the browser during checkout.
 const DEFAULT_CREDIT_PACK_PRICES = { "100": 35000, "500": 150000, "1000": 300000 };
+
+const DEFAULT_CREDIT_TIERS = [
+  { min: 1, max: 20, priceCents: 500 },
+  { min: 21, max: 50, priceCents: 450 },
+  { min: 51, max: 100, priceCents: 400 },
+  { min: 101, max: 500, priceCents: 350 },
+  { min: 501, max: 1000, priceCents: 300 }
+];
 app.get('/v1/admin/pricing', requireUser, requireOwnerOrReseller, async (req, res) => {
   try {
     const snap = await db.collection('hypeSettings').doc('commercial').get();
     const settings = snap.exists ? snap.data() : {};
-    return res.json({ packs: settings.packPrices || DEFAULT_CREDIT_PACK_PRICES,
-      licenseCosts: settings.licenseCosts || JSON.parse(process.env.LICENSE_CREDIT_COSTS_JSON || '{"30":1,"90":3,"120":4}'),
-      canEdit: req.hypeRole.role === 'owner' });
+
+    return res.json({
+      packs: settings.packPrices || DEFAULT_CREDIT_PACK_PRICES,
+      creditTiers: settings.creditTiers || DEFAULT_CREDIT_TIERS,
+      licenseCosts: settings.licenseCosts || JSON.parse(
+        process.env.LICENSE_CREDIT_COSTS_JSON || '{"30":1,"90":3,"120":4}'
+      ),
+      canEdit: req.hypeRole.role === 'owner'
+    });
   } catch (err) {
     console.error('[pricing get]', err);
     return res.status(500).json({ error: 'Não foi possível consultar preços.' });
   }
 });
+
 app.put('/v1/admin/pricing', requireUser, requireOwner, async (req, res) => {
-  const packs = req.body?.packs || {};
-  const normalized = {};
-  for (const count of ['100', '500', '1000']) {
-    const value = Number(packs[count]);
-    if (!Number.isSafeInteger(value) || value < 100 || value > 100000000) {
-      return res.status(400).json({ error: `Preço inválido para pacote ${count}. Informe centavos de BRL.` });
-    }
-    normalized[count] = value;
+  const rawTiers = req.body?.creditTiers;
+
+  if (!Array.isArray(rawTiers) || rawTiers.length < 1 || rawTiers.length > 20) {
+    return res.status(400).json({ error: 'Informe entre 1 e 20 faixas.' });
   }
+
+  const creditTiers = [];
+  let expectedMin = 1;
+
+  for (const item of rawTiers) {
+    const min = Number(item.min);
+    const max = Number(item.max);
+    const priceCents = Number(item.priceCents);
+
+    if (
+      !Number.isSafeInteger(min) ||
+      !Number.isSafeInteger(max) ||
+      !Number.isSafeInteger(priceCents) ||
+      min !== expectedMin ||
+      max < min ||
+      max > 1000 ||
+      priceCents < 100 ||
+      priceCents > 100000000
+    ) {
+      return res.status(400).json({
+        error: 'Faixas inválidas. Confira quantidades e preços.'
+      });
+    }
+
+    creditTiers.push({ min, max, priceCents });
+    expectedMin = max + 1;
+  }
+
+  if (expectedMin !== 1001) {
+    return res.status(400).json({
+      error: 'As faixas precisam cobrir de 1 a 1.000 créditos.'
+    });
+  }
+
   const rawCosts = req.body?.licenseCosts || {};
   const licenseCosts = {};
+
   for (const days of ['30', '90', '120']) {
     const cost = Number(rawCosts[days]);
+
     if (!Number.isSafeInteger(cost) || cost < 1 || cost > 100000) {
-      return res.status(400).json({ error: `Custo inválido para licença de ${days} dias.` });
+      return res.status(400).json({
+        error: `Custo inválido para licença de ${days} dias.`
+      });
     }
+
     licenseCosts[days] = cost;
   }
-  await db.collection('hypeSettings').doc('commercial').set({
-    packPrices: normalized, licenseCosts,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedBy: req.hypeUser.uid
-  }, { merge: true });
-  return res.json({ ok: true, packs: normalized, licenseCosts });
-});
 
+  await db.collection('hypeSettings').doc('commercial').set({
+    creditTiers,
+    licenseCosts,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedBy: req.hypeUser.uid
+  }, { merge: true });
+
+  return res.json({ ok: true, creditTiers, licenseCosts });
+});
 // Create reseller accounts directly from the owner panel; send password setup link manually.
 app.post('/v1/admin/resellers/create', requireUser, requireOwner, async (req, res) => {
   const name = String(req.body?.name || '').trim().slice(0, 100);
@@ -1122,20 +1175,34 @@ app.post('/v1/credits/checkout', requireUser, requireOwnerOrReseller, async (req
   }
 
   const priceSnap = await db.collection('hypeSettings').doc('commercial').get();
-  const packPrices = priceSnap.exists && priceSnap.data().packPrices
-    ? priceSnap.data().packPrices : DEFAULT_CREDIT_PACK_PRICES;
-  const basePackCents = Number(packPrices['100']);
-  if (!Number.isSafeInteger(basePackCents) || basePackCents < 100) {
-    return res.status(503).json({ error: 'Preço-base do pacote de 100 créditos não configurado.' });
+  const settings = priceSnap.exists ? priceSnap.data() : {};
+  const creditTiers = settings.creditTiers || DEFAULT_CREDIT_TIERS;
+
+  if (!Array.isArray(creditTiers)) {
+    return res.status(503).json({ error: 'Tabela comercial inválida.' });
   }
 
-  const unitPriceCents = Math.round(basePackCents / 100);
+  const tier = creditTiers.find(t =>
+    credits >= Number(t.min) && credits <= Number(t.max)
+  );
+
+  if (!tier) {
+    return res.status(503).json({
+      error: 'Não existe faixa de preço para essa quantidade.'
+    });
+  }
+
+  const unitPriceCents = Number(tier.priceCents);
   const totalCents = unitPriceCents * credits;
 
-  if (!Number.isSafeInteger(totalCents) || totalCents < 100) {
-    return res.status(400).json({ error: 'Valor mínimo de compra não atingido.' });
+  if (
+    !Number.isSafeInteger(unitPriceCents) ||
+    unitPriceCents < 100 ||
+    !Number.isSafeInteger(totalCents) ||
+    totalCents < 100
+  ) {
+    return res.status(400).json({ error: 'Preço ou valor total inválido.' });
   }
-
   if (!process.env.CHECKOUT_SUCCESS_URL || !process.env.CHECKOUT_CANCEL_URL) {
     return res.status(503).json({
       error: 'URLs de retorno do checkout nao configuradas.'
