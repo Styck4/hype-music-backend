@@ -44,7 +44,7 @@ app.post('/v1/webhooks/stripe', express.raw({ type: 'application/json' }), async
         const uid = session.client_reference_id || session.metadata?.firebaseUid;
         const credits = Number(session.metadata?.credits || 0);
         const declaredTotal = Number(session.metadata?.totalCents || 0);
-        if (!uid || ![100, 500, 1000].includes(credits) ||
+        if (!uid || !Number.isSafeInteger(credits) || credits < 1 || credits > 1000 ||
             session.currency !== 'brl' || Number(session.amount_total) !== declaredTotal ||
             !Number.isSafeInteger(declaredTotal) || declaredTotal < 100) {
           throw new Error('Pacote de créditos inválido no webhook.');
@@ -1117,18 +1117,24 @@ app.post('/v1/credits/checkout', requireUser, requireOwnerOrReseller, async (req
   }
 
   const credits = Number(req.body?.credits ?? req.body?.quantity ?? req.body?.pack);
-  if (![100, 500, 1000].includes(credits)) {
-    return res.status(400).json({ error: 'Escolha um pacote de 100, 500 ou 1.000 créditos.' });
+  if (!Number.isSafeInteger(credits) || credits < 1 || credits > 1000) {
+    return res.status(400).json({ error: 'Escolha entre 1 e 1.000 créditos.' });
   }
 
   const priceSnap = await db.collection('hypeSettings').doc('commercial').get();
   const packPrices = priceSnap.exists && priceSnap.data().packPrices
     ? priceSnap.data().packPrices : DEFAULT_CREDIT_PACK_PRICES;
-  const totalCents = Number(packPrices[String(credits)]);
-  if (!Number.isSafeInteger(totalCents) || totalCents < 100) {
-    return res.status(503).json({ error: 'Preço deste pacote não está configurado pelo proprietário.' });
+  const basePackCents = Number(packPrices['100']);
+  if (!Number.isSafeInteger(basePackCents) || basePackCents < 100) {
+    return res.status(503).json({ error: 'Preço-base do pacote de 100 créditos não configurado.' });
   }
-  const unitPriceCents = Math.round(totalCents / credits);
+
+  const unitPriceCents = Math.round(basePackCents / 100);
+  const totalCents = unitPriceCents * credits;
+
+  if (!Number.isSafeInteger(totalCents) || totalCents < 100) {
+    return res.status(400).json({ error: 'Valor mínimo de compra não atingido.' });
+  }
 
   if (!process.env.CHECKOUT_SUCCESS_URL || !process.env.CHECKOUT_CANCEL_URL) {
     return res.status(503).json({
